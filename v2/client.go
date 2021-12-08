@@ -80,6 +80,7 @@ type Client struct {
 
 	tableName        string
 	partitionKeyName string
+	sortKeyName      string
 
 	leaseDuration               time.Duration
 	heartbeatPeriod             time.Duration
@@ -143,6 +144,11 @@ func WithPartitionKeyName(s string) ClientOption {
 	return func(c *Client) { c.partitionKeyName = s }
 }
 
+// WithSortKeyName defines the sort key name. If not specified, no sort key will be used.
+func WithSortKeyName(s string) ClientOption {
+	return func(c *Client) { c.sortKeyName = s }
+}
+
 // WithOwnerName changes the owner linked to the client, and by consequence to
 // locks.
 func WithOwnerName(s string) ClientOption {
@@ -201,6 +207,14 @@ func ReplaceData() AcquireLockOption {
 func FailIfLocked() AcquireLockOption {
 	return func(opt *acquireLockOptions) {
 		opt.failIfLocked = true
+	}
+}
+
+// WithSortKey defines the sort key that should be used when connecting to DynamoDB.
+// Note that this requires the client to have had WithSortKeyName specified.
+func WithSortKey(s string) AcquireLockOption {
+	return func(opt *acquireLockOptions) {
+		opt.sortKey = s
 	}
 }
 
@@ -316,6 +330,7 @@ func (c *Client) acquireLock(ctx context.Context, opt *acquireLockOptions) (*Loc
 
 	getLockOptions := getLockOptions{
 		partitionKeyName:     opt.partitionKey,
+		sortKeyName:          opt.sortKey,
 		deleteLockOnRelease:  opt.deleteLockOnRelease,
 		sessionMonitor:       opt.sessionMonitor,
 		start:                time.Now(),
@@ -351,9 +366,35 @@ func (c *Client) acquireLock(ctx context.Context, opt *acquireLockOptions) (*Loc
 	}
 }
 
+// InvalidSortKeyNameError is an error that's used to indicate that either a sort key was expected and not given,
+// or was given and not expected.
+
+var (
+	// SortKeyExpectedError indicates that a sort key was passed to AcquireLock (or AcquireLockWithContext), but was
+	// not provided in the constructor of the Client.
+	SortKeyNotExpectedError = errors.New("sort key given when none was expected")
+
+	// SortKeyExpectedError indicates that no sort key was was passed to AcquireLock (or AcquireLockWithContext), but
+	// one was provided in the constructor of the Client (and thus, is required).
+	SortKeyExpectedError = errors.New("sort key expected when none was given")
+)
+
 func (c *Client) storeLock(ctx context.Context, getLockOptions *getLockOptions) (*Lock, error) {
+	if (c.sortKeyName == "") && (getLockOptions.sortKeyName != "") {
+		return nil, SortKeyNotExpectedError
+	}
+
+	if (c.sortKeyName != "") && (getLockOptions.sortKeyName == "") {
+		return nil, SortKeyExpectedError
+	}
+
+	sortName := ""
+	if getLockOptions.sortKeyName != "" {
+		sortName += "." + getLockOptions.sortKeyName
+	}
+
 	c.logger.Println(ctx, "Call GetItem to see if the lock for ",
-		c.partitionKeyName, " =", getLockOptions.partitionKeyName, " exists in the table")
+		c.partitionKeyName, sortName, " =", getLockOptions.partitionKeyName, " exists in the table")
 	existingLock, err := c.getLockFromDynamoDB(ctx, *getLockOptions)
 	if err != nil {
 		return nil, err
@@ -385,6 +426,9 @@ func (c *Client) storeLock(ctx context.Context, getLockOptions *getLockOptions) 
 		item[k] = v
 	}
 	item[c.partitionKeyName] = stringAttrValue(getLockOptions.partitionKeyName)
+	if c.sortKeyName != "" {
+		item[c.sortKeyName] = stringAttrValue(getLockOptions.sortKeyName)
+	}
 	item[attrOwnerName] = stringAttrValue(c.ownerName)
 	item[attrLeaseDuration] = stringAttrValue(c.leaseDuration.String())
 
@@ -401,6 +445,7 @@ func (c *Client) storeLock(ctx context.Context, getLockOptions *getLockOptions) 
 			ctx,
 			getLockOptions.additionalAttributes,
 			getLockOptions.partitionKeyName,
+			getLockOptions.sortKeyName,
 			getLockOptions.deleteLockOnRelease,
 			newLockData,
 			item,
@@ -442,6 +487,7 @@ func (c *Client) storeLock(ctx context.Context, getLockOptions *getLockOptions) 
 			ctx,
 			getLockOptions.additionalAttributes,
 			getLockOptions.partitionKeyName,
+			getLockOptions.sortKeyName,
 			getLockOptions.deleteLockOnRelease,
 			existingLock, newLockData, item,
 			recordVersionNumber,
@@ -473,7 +519,8 @@ func (c *Client) storeLock(ctx context.Context, getLockOptions *getLockOptions) 
 func (c *Client) upsertAndMonitorExpiredLock(
 	ctx context.Context,
 	additionalAttributes map[string]types.AttributeValue,
-	key string,
+	partitionKey string,
+	sortKey string,
 	deleteLockOnRelease bool,
 	existingLock *Lock,
 	newLockData []byte,
@@ -481,10 +528,22 @@ func (c *Client) upsertAndMonitorExpiredLock(
 	recordVersionNumber string,
 	sessionMonitor *sessionMonitor,
 ) (*Lock, error) {
-	cond := expression.And(
-		expression.AttributeExists(expression.Name(c.partitionKeyName)),
-		expression.Equal(rvnAttr, expression.Value(existingLock.recordVersionNumber)),
-	)
+	var cond expression.ConditionBuilder
+
+	if sortKey == "" {
+		cond = expression.And(
+			expression.AttributeExists(expression.Name(c.partitionKeyName)),
+			expression.Equal(rvnAttr, expression.Value(existingLock.recordVersionNumber)),
+		)
+	} else {
+		cond = expression.And(
+			expression.AttributeExists(expression.Name(c.partitionKeyName)),
+			expression.And(
+				expression.AttributeExists(expression.Name(c.sortKeyName)),
+				expression.Equal(rvnAttr, expression.Value(existingLock.recordVersionNumber)),
+			),
+		)
+	}
 	putItemExpr, _ := expression.NewBuilder().WithCondition(cond).Build()
 	putItemRequest := &dynamodb.PutItemInput{
 		Item:                      item,
@@ -495,29 +554,48 @@ func (c *Client) upsertAndMonitorExpiredLock(
 	}
 
 	c.logger.Println(ctx, "Acquiring an existing lock whose revisionVersionNumber did not change for ",
-		c.partitionKeyName, " partitionKeyName=", key)
+		c.partitionKeyName, " partitionKeyName=", partitionKey, " sortKey=", sortKey)
 	return c.putLockItemAndStartSessionMonitor(
-		ctx, additionalAttributes, key, deleteLockOnRelease, newLockData,
+		ctx, additionalAttributes, partitionKey, sortKey, deleteLockOnRelease, newLockData,
 		recordVersionNumber, sessionMonitor, putItemRequest)
 }
 
 func (c *Client) upsertAndMonitorNewOrReleasedLock(
 	ctx context.Context,
 	additionalAttributes map[string]types.AttributeValue,
-	key string,
+	partitionKey string,
+	sortKey string,
 	deleteLockOnRelease bool,
 	newLockData []byte,
 	item map[string]types.AttributeValue,
 	recordVersionNumber string,
 	sessionMonitor *sessionMonitor,
 ) (*Lock, error) {
-	cond := expression.Or(
-		expression.AttributeNotExists(expression.Name(c.partitionKeyName)),
-		expression.And(
-			expression.AttributeExists(expression.Name(c.partitionKeyName)),
-			expression.Equal(isReleasedAttr, isReleasedAttrVal),
-		),
-	)
+	var cond expression.ConditionBuilder
+
+	if sortKey == "" {
+		cond = expression.Or(
+			expression.AttributeNotExists(expression.Name(c.partitionKeyName)),
+			expression.And(
+				expression.AttributeExists(expression.Name(c.partitionKeyName)),
+				expression.Equal(isReleasedAttr, isReleasedAttrVal),
+			),
+		)
+	} else {
+		cond = expression.Or(
+			expression.AttributeNotExists(expression.Name(c.partitionKeyName)),
+			expression.Or(
+				expression.AttributeNotExists(expression.Name(c.sortKeyName)),
+				expression.And(
+					expression.AttributeExists(expression.Name(c.partitionKeyName)),
+					expression.And(
+						expression.AttributeExists(expression.Name(c.sortKeyName)),
+						expression.Equal(isReleasedAttr, isReleasedAttrVal),
+					),
+				),
+			),
+		)
+	}
 	putItemExpr, _ := expression.NewBuilder().WithCondition(cond).Build()
 
 	req := &dynamodb.PutItemInput{
@@ -532,8 +610,14 @@ func (c *Client) upsertAndMonitorNewOrReleasedLock(
 	// lock into DynamoDB should err on the side of thinking the lock will
 	// expire sooner than it actually will, so they start counting towards
 	// its expiration before the Put succeeds
-	c.logger.Println(ctx, "Acquiring a new lock or an existing yet released lock on ", c.partitionKeyName, "=", key)
-	return c.putLockItemAndStartSessionMonitor(ctx, additionalAttributes, key,
+	sortKeyDescr := ""
+	if sortKey != "" {
+		sortKeyDescr = fmt.Sprintf(", %v=%v", c.sortKeyName, sortKey)
+	}
+
+	c.logger.Println(ctx, "Acquiring a new lock or an existing yet released lock on",
+		c.partitionKeyName, "=", partitionKey, sortKeyDescr)
+	return c.putLockItemAndStartSessionMonitor(ctx, additionalAttributes, partitionKey, sortKey,
 		deleteLockOnRelease, newLockData,
 		recordVersionNumber, sessionMonitor, req)
 }
@@ -541,7 +625,8 @@ func (c *Client) upsertAndMonitorNewOrReleasedLock(
 func (c *Client) putLockItemAndStartSessionMonitor(
 	ctx context.Context,
 	additionalAttributes map[string]types.AttributeValue,
-	key string,
+	partitionKey string,
+	sortKey string,
 	deleteLockOnRelease bool,
 	newLockData []byte,
 	recordVersionNumber string,
@@ -557,7 +642,8 @@ func (c *Client) putLockItemAndStartSessionMonitor(
 
 	lockItem := &Lock{
 		client:               c,
-		partitionKey:         key,
+		partitionKey:         partitionKey,
+		sortKey:              sortKey,
 		data:                 newLockData,
 		deleteLockOnRelease:  deleteLockOnRelease,
 		ownerName:            c.ownerName,
@@ -715,6 +801,14 @@ type CreateTableOption func(*createDynamoDBTableOptions)
 func WithCustomPartitionKeyName(s string) CreateTableOption {
 	return func(opt *createDynamoDBTableOptions) {
 		opt.partitionKeyName = s
+	}
+}
+
+// WithCustomSortKeyName changes the sort key name of the table. If not specified,
+// no sort key will be used.
+func WithCustomSortKeyName(s string) CreateTableOption {
+	return func(opt *createDynamoDBTableOptions) {
+		opt.sortKeyName = s
 	}
 }
 
