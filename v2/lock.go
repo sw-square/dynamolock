@@ -30,6 +30,7 @@ type Lock struct {
 
 	client       *Client
 	partitionKey string
+	sortKey      string
 
 	data                []byte
 	ownerName           string
@@ -41,6 +42,10 @@ type Lock struct {
 	recordVersionNumber  string
 	leaseDuration        time.Duration
 	additionalAttributes map[string]types.AttributeValue
+}
+
+func (l *Lock) PartitionAndSortKey() (string, string) {
+	return l.partitionKey, l.sortKey
 }
 
 // Data returns the content of the lock, if any is available.
