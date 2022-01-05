@@ -47,13 +47,14 @@ func TestMain(m *testing.M) {
 	}
 	_ = os.Remove(filepath.Join("local-dynamodb", "shared-local-instance.db")) // unconditionally remove state file
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, javaPath, "-Djava.library.path=./DynamoDBLocal_lib", "-jar", "DynamoDBLocal.jar", "-sharedDb")
+	cmd := exec.CommandContext(ctx, javaPath, "-Djava.library.path=./DynamoDBLocal_lib",
+		"-jar", "DynamoDBLocal.jar", "-sharedDb")
 	cmd.Dir = "local-dynamodb"
 	if err := cmd.Start(); err != nil {
 		panic("cannot start local dynamodb:" + err.Error())
 	}
 	for i := 0; i < 10; i++ {
-		c, err := net.Dial("tcp", "localhost:8000")
+		c, err := net.Dial("tcp", "localhost:4566")
 		if err != nil {
 			time.Sleep(1 * time.Second)
 			continue
@@ -72,7 +73,7 @@ func defaultConfig(t *testing.T) aws.Config {
 		Region: "us-west-2",
 		EndpointResolver: aws.EndpointResolverFunc(
 			func(service, region string) (aws.Endpoint, error) {
-				return aws.Endpoint{URL: "http://localhost:8000/"}, nil
+				return aws.Endpoint{URL: "http://localhost:4566/"}, nil
 			},
 		),
 		Credentials: credentials.StaticCredentialsProvider{
